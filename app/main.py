@@ -10,14 +10,17 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .db import get_conn, get_setting, normalize_institution, normalize_topics, seed_demo_data, set_setting, transaction
+from .declarations import DeclarationError
+from . import declarations as decl_svc
 from .schemas import (
     ConflictIn,
+    DeclarationSubmitIn,
     LockIn,
     ManuscriptIn,
     ManuscriptPatch,
@@ -38,6 +41,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="匿名评审分配系统", lifespan=lifespan)
+
+
+@app.exception_handler(DeclarationError)
+def declaration_error_handler(request: Request, exc: DeclarationError):
+    # 错误消息只含申报记录 ID / 稿件标题，绝不回传令牌或其哈希
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 
 # ------------------------------------------------------------- 状态序列化
@@ -104,6 +113,8 @@ def build_state(conn: sqlite3.Connection) -> dict:
         "reviewers": rv_list,
         "conflicts": conflicts,
         "assignments": assignments,
+        # 利益冲突自助申报链接状态（不含令牌明文/哈希）
+        "declarations": decl_svc.list_declarations(conn),
         "solution": solution,
     }
 
@@ -265,6 +276,48 @@ def delete_conflict(m_id: int, r_id: int, conn=Depends(get_conn)):
     return build_state(conn)
 
 
+# -------------------------------------------- 利益冲突自助申报（管理端）
+@app.post("/api/reviewers/{r_id}/declarations")
+def issue_declaration(r_id: int, request: Request, conn=Depends(get_conn)):
+    """为评审人签发一次性申报链接。
+
+    旧的待提交链接立即失效（同一评审人至多一个待提交链接）。
+    明文令牌仅此一次随响应返回；库内与后续接口只保存/出现哈希之外的状态信息。
+    """
+    decl_id, token, info = decl_svc.issue_declaration(conn, r_id)
+    return {
+        "declaration": info,
+        "token": token,  # 明文令牌仅本次签发响应可见
+        "path": f"/declarations/{token}",
+        "url": str(request.base_url).rstrip("/") + f"/declarations/{token}",
+        "state": build_state(conn),
+    }
+
+
+@app.post("/api/declarations/{decl_id}/revoke")
+def revoke_declaration(decl_id: int, conn=Depends(get_conn)):
+    """撤销待提交的申报链接；已提交/已失效返回 409。"""
+    decl_svc.revoke_declaration(conn, decl_id)
+    return build_state(conn)
+
+
+# ---------------------------------------- 利益冲突自助申报（评审人公开页）
+@app.get("/api/public/declarations/{token}")
+def public_declaration(token: str, conn=Depends(get_conn)):
+    """评审人凭令牌查看：待提交时仅返回签发清单中的稿件标题。"""
+    return decl_svc.get_public_declaration(conn, token)
+
+
+@app.post("/api/public/declarations/{token}/submit")
+def public_declaration_submit(token: str, body: DeclarationSubmitIn, conn=Depends(get_conn)):
+    """一次性提交：单事务合并进冲突矩阵并立即失效链接。
+
+    重复提交、清单版本变化（稿件增删/标题修改）返回 409 且不写入；
+    勾选含锁定分配对应稿件时同样整单 409，不做部分写入。
+    """
+    return decl_svc.submit_declaration(conn, token, body.conflict_manuscript_ids)
+
+
 # ----------------------------------------------------------------- 设置
 @app.put("/api/settings")
 def update_settings(body: SettingsIn, conn=Depends(get_conn)):
@@ -363,6 +416,7 @@ def load_demo(conn=Depends(get_conn)):
     with transaction(conn):
         conn.execute("DELETE FROM assignments")
         conn.execute("DELETE FROM conflicts")
+        conn.execute("DELETE FROM conflict_declarations")
         conn.execute("DELETE FROM manuscripts")
         conn.execute("DELETE FROM reviewers")
         seed_demo_data(conn)
@@ -376,6 +430,7 @@ def reset_all(conn=Depends(get_conn)):
     with transaction(conn):
         conn.execute("DELETE FROM assignments")
         conn.execute("DELETE FROM conflicts")
+        conn.execute("DELETE FROM conflict_declarations")
         conn.execute("DELETE FROM manuscripts")
         conn.execute("DELETE FROM reviewers")
         set_setting(conn, "last_solution", None)
@@ -386,6 +441,12 @@ def reset_all(conn=Depends(get_conn)):
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+# 评审人自助申报页（公开，凭路径中的一次性令牌访问）
+@app.get("/declarations/{token}")
+def declaration_page(token: str):
+    return FileResponse(os.path.join(STATIC_DIR, "declaration.html"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

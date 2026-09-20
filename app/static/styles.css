@@ -243,3 +243,14 @@ table.matrix { border-collapse: collapse; width: 100%; min-width: 500px; }
 .toast.hidden { display: none; }
 
 .empty { color: var(--muted); text-align: center; padding: 26px 0; font-size: 13px; }
+
+/* ---------------- 利益冲突自助申报状态 ---------------- */
+.decl-badge {
+  display: inline-block; border-radius: 20px; padding: 2px 10px; font-size: 12px;
+  font-weight: 600; margin-right: 6px;
+}
+.decl-badge.decl-none { background: #eef1f7; color: var(--muted); }
+.decl-badge.decl-pending { background: var(--amber-soft); color: var(--amber); }
+.decl-badge.decl-stale { background: #fbe3e0; color: #b03a2e; }
+.decl-badge.decl-submitted { background: var(--green-soft); color: var(--green); }
+.decl-badge.decl-revoked { background: #eef1f7; color: var(--muted); }

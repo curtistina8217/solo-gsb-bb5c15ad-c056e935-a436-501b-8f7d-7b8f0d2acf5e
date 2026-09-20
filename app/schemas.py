@@ -59,6 +59,11 @@ class LockIn(BaseModel):
     locked: bool
 
 
+class DeclarationSubmitIn(BaseModel):
+    """评审人一次性申报提交体：勾选存在冲突的稿件 ID 列表（空列表=无冲突）。"""
+    conflict_manuscript_ids: List[int] = Field(default_factory=list, max_length=1000)
+
+
 class TopicsIn(BaseModel):
     """仅用于前端校验的占位模型（当前未使用，保留扩展）。"""
 

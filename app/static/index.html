@@ -27,6 +27,7 @@
     <button class="tab" data-tab="manuscripts">稿件</button>
     <button class="tab" data-tab="reviewers">评审人</button>
     <button class="tab" data-tab="conflicts">作者冲突</button>
+    <button class="tab" data-tab="declarations">利益冲突申报</button>
   </nav>
 
   <main>
@@ -125,7 +126,40 @@
         <div id="conflict-matrix" class="matrix-wrap"></div>
       </div>
     </section>
+
+    <!-- ===================== 利益冲突自助申报 ===================== -->
+    <section id="tab-declarations" class="tab-panel">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>利益冲突自助申报链接</h2>
+          <p class="hint">
+            为评审人生成<strong>一次性</strong>申报链接：链接绑定签发时的稿件清单版本，评审人仅能看到稿件标题并勾选冲突，
+            提交后勾选结果在单个事务中合并进冲突矩阵，链接立即失效。<br/>
+            签发后若稿件有增删或标题变化，评审人的提交将返回 <strong>409 且不写入</strong>，状态会标记「清单已变化」，请重新生成链接。
+            每位评审人至多有一个待提交链接；重新生成会使旧链接失效。
+          </p>
+        </div>
+        <div id="declaration-list"></div>
+      </div>
+    </section>
   </main>
+
+  <!-- 申报链接弹窗（明文链接仅生成后展示这一次） -->
+  <div id="link-modal" class="modal hidden">
+    <div class="modal-card">
+      <h3>申报链接已生成</h3>
+      <p class="hint" id="link-modal-desc"></p>
+      <label style="font-size:12.5px;color:var(--muted);display:block;margin:12px 0 6px">
+        请立即复制并发送给评审人；关闭本窗口后无法再次查看完整链接。
+        <input type="text" id="link-modal-input" readonly
+          style="width:100%;margin-top:6px;font-size:12.5px;background:#f7f9fd" />
+      </label>
+      <div class="modal-actions">
+        <button id="link-modal-copy" class="btn">复制链接</button>
+        <button id="link-modal-close" class="btn primary">关闭</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 通用编辑弹窗 -->
   <div id="modal" class="modal hidden">

@@ -358,6 +358,72 @@ function renderConflicts() {
   $("#conflict-matrix").innerHTML = `<table class="matrix">${head}${rows}</table>`;
 }
 
+/* --------------------------------------------------------------- 渲染：自助申报链接 */
+const DECL_STATUS = {
+  none: { label: "未签发", cls: "decl-none" },
+  pending: { label: "待提交", cls: "decl-pending" },
+  stale: { label: "待提交 · 清单已变化", cls: "decl-stale" },
+  submitted: { label: "已提交", cls: "decl-submitted" },
+  revoked: { label: "已失效", cls: "decl-revoked" },
+};
+
+function latestDeclarationByReviewer() {
+  // 每位评审人取最新一条申报（id 最大）
+  const latest = new Map();
+  for (const d of state.declarations || []) {
+    const cur = latest.get(d.reviewer_id);
+    if (!cur || d.id > cur.id) latest.set(d.reviewer_id, d);
+  }
+  return latest;
+}
+
+function declStatusOf(d) {
+  if (!d) return "none";
+  if (d.status === "pending") return d.stale ? "stale" : "pending";
+  return d.status; // submitted / revoked
+}
+
+function renderDeclarations() {
+  if (!state.reviewers.length) {
+    $("#declaration-list").innerHTML =
+      `<div class="empty">暂无评审人，请先到「评审人」页录入。</div>`;
+    return;
+  }
+  const latest = latestDeclarationByReviewer();
+  $("#declaration-list").innerHTML = state.reviewers.map((r) => {
+    const d = latest.get(r.id);
+    const status = declStatusOf(d);
+    const meta = DECL_STATUS[status];
+    let detail = "";
+    let actions = `<button class="btn small primary" data-decl-issue="${r.id}">
+      ${d ? "重新生成链接" : "生成申报链接"}</button>`;
+    if (d) {
+      if (d.status === "pending") {
+        detail = `签发于 ${d.created_at} · 清单 ${d.manifest_count} 篇` +
+          (d.stale ? ` · <span class="excl">稿件已增删或标题变化，评审人提交将返回 409，请重新生成</span>` : "");
+        actions += ` <button class="btn small danger-ghost" data-decl-revoke="${d.id}">撤销链接</button>`;
+      } else if (d.status === "submitted") {
+        const n = (d.submitted_conflicts || []).length;
+        detail = `提交于 ${d.submitted_at || "—"} · 勾选冲突 ${n} 篇（已合并进冲突矩阵）`;
+      } else if (d.status === "revoked") {
+        detail = `失效于 ${d.revoked_at || "—"} · ${esc(d.revoked_reason || "已撤销")}`;
+      }
+    } else {
+      detail = "尚未生成过申报链接";
+    }
+    return `<div class="entity-row" data-decl-row="${r.id}">
+      <div class="entity-main">
+        <div class="entity-title">${esc(r.name)}</div>
+        <div class="entity-sub">
+          <span class="decl-badge ${meta.cls}">${meta.label}</span>
+          ${detail}
+        </div>
+      </div>
+      <div class="entity-actions">${actions}</div>
+    </div>`;
+  }).join("");
+}
+
 /* --------------------------------------------------------------- 设置 */
 function renderSettings() {
   $("#set-default-req").value = state.settings.default_required_reviews;
@@ -376,6 +442,7 @@ function render() {
   renderManuscripts();
   renderReviewers();
   renderConflicts();
+  renderDeclarations();
   renderSettings();
 }
 
@@ -413,6 +480,18 @@ function openModal(title, fields, onOk) {
       toast(e.message, true);
     }
   };
+}
+
+/* ------------------------------------------------- 申报链接弹窗（一次性明文展示） */
+function openLinkModal(reviewerName, url, manifestCount) {
+  $("#link-modal-desc").textContent =
+    `评审人：${reviewerName} · 绑定稿件清单 ${manifestCount} 篇（提交时清单若已变化将返回 409）。`;
+  $("#link-modal-input").value = url;
+  $("#link-modal").classList.remove("hidden");
+}
+
+function closeLinkModal() {
+  $("#link-modal").classList.add("hidden");
 }
 
 /* --------------------------------------------------------------- 事件绑定 */
@@ -489,6 +568,8 @@ function bindEvents() {
     const delR = e.target.closest("[data-del-r]");
     const lockBtn = e.target.closest("[data-lock]");
     const manualBtn = e.target.closest("[data-manual-lock]");
+    const issueBtn = e.target.closest("[data-decl-issue]");
+    const revokeBtn = e.target.closest("[data-decl-revoke]");
 
     if (editM) {
       const m = state._mById[editM.dataset.editM];
@@ -546,12 +627,30 @@ function bindEvents() {
           manuscript_id: mId, reviewer_id: Number(sel.value), locked: true,
         }),
       }), "已锁定该既有分配并重新求解");
+    } else if (issueBtn) {
+      const rId = Number(issueBtn.dataset.declIssue);
+      const r = state._rById[rId];
+      if (!confirm(`为评审人 ${r.name} 生成一次性申报链接？其已有的待提交链接将立即失效。`)) return;
+      const btn = issueBtn;
+      btn.disabled = true;
+      try {
+        const data = await api(`/api/reviewers/${rId}/declarations`, { method: "POST" });
+        state = data.state;
+        render();
+        openLinkModal(r.name, data.url, data.declaration.manifest_count);
+      } catch (err) { toast(err.message, true); } finally {
+        btn.disabled = false;
+      }
+    } else if (revokeBtn) {
+      const declId = Number(revokeBtn.dataset.declRevoke);
+      if (!confirm("确定撤销该待提交申报链接？撤销后评审人将无法打开/提交，需要重新生成。")) return;
+      await runAction(api(`/api/declarations/${declId}/revoke`, { method: "POST" }),
+        "申报链接已撤销");
     }
   });
 
   // 冲突矩阵
-  $("#conflict-matrix").addEventListener("change", async (e) => {
-    const cb = e.target.closest("input[data-conflict]");
+  $("#conflict-matrix").addEventListener("change", async (e) => {    const cb = e.target.closest("input[data-conflict]");
     if (!cb) return;
     const mId = Number(cb.dataset.conflict);
     const rId = Number(cb.dataset.reviewer);
@@ -581,6 +680,23 @@ function bindEvents() {
         institution_cap: Number($("#set-inst-cap").value),
       }),
     }), "设置已保存（点击“重新求解分配”可按新权重/机构上限计算）");
+  });
+
+  // 申报链接弹窗：关闭 / 复制（明文链接仅此一次展示）
+  $("#link-modal-close").addEventListener("click", closeLinkModal);
+  $("#link-modal").addEventListener("click", (e) => {
+    if (e.target === $("#link-modal")) closeLinkModal();
+  });
+  $("#link-modal-copy").addEventListener("click", async () => {
+    const input = $("#link-modal-input");
+    try {
+      await navigator.clipboard.writeText(input.value);
+      toast("链接已复制，请发送给评审人");
+    } catch (e) {
+      input.select();
+      document.execCommand("copy");
+      toast("链接已复制，请发送给评审人");
+    }
   });
 
   // 记录用户是否手动改过默认输入框

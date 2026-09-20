@@ -24,9 +24,11 @@ DEFAULTS = {
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 并发提交（如同一直连令牌被双击）时让第二个写事务等待而不是立刻报 locked
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -87,6 +89,29 @@ CREATE TABLE IF NOT EXISTS assignments (
     locked INTEGER NOT NULL DEFAULT 0,
     UNIQUE (m_id, r_id)
 );
+
+-- 利益冲突自助申报：管理员为评审人生成的一次性申报链接
+-- token 仅以 SHA-256 哈希存储（token_hash），明文令牌只在签发响应中出现一次；
+-- manifest 绑定签发时的稿件清单（id+标题）与版本哈希 manifest_hash，
+-- 提交时当前清单版本与之不符（稿件增删或标题变化）一律 409 且不写入。
+CREATE TABLE IF NOT EXISTS conflict_declarations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    reviewer_id      INTEGER NOT NULL REFERENCES reviewers(id) ON DELETE CASCADE,
+    token_hash       TEXT NOT NULL UNIQUE,        -- 令牌的 SHA-256 哈希（hex），接口/日志不回传
+    manifest         TEXT NOT NULL DEFAULT '[]',  -- 签发时稿件清单快照 [{"id","title"}]（JSON）
+    manifest_hash    TEXT NOT NULL,               -- 签发时稿件清单版本哈希（规范化 JSON 的 sha256）
+    status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending','submitted','revoked')),
+    submitted_conflicts TEXT,                     -- 提交时勾选的稿件 ID 列表（JSON，仅提交后写入）
+    revoked_reason   TEXT,                        -- 撤销原因（管理员撤销 / 重新签发顶替）
+    created_at       TEXT NOT NULL,
+    submitted_at     TEXT,
+    revoked_at       TEXT
+);
+
+-- 每位评审人至多存在一个待提交链接：重新签发会把旧链接顶替为 revoked
+CREATE UNIQUE INDEX IF NOT EXISTS idx_declarations_one_pending_per_reviewer
+    ON conflict_declarations(reviewer_id) WHERE status = 'pending';
 """
 
 
@@ -116,6 +141,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     - reviewers.institution：评审人可选机构（旧库补列，默认空串=未填写）。
     - reviewers.can_lead / manuscripts.required_leads：主审资格硬约束
       （旧库补列，默认 0=不可任主审 / 不需主审，即该约束默认关闭）。
+    - conflict_declarations：利益冲突自助申报链接表（含 token 哈希、
+      签发稿件清单快照与版本哈希、状态）。新表由 SCHEMA 中的
+      CREATE TABLE IF NOT EXISTS 在建库脚本里幂等创建，旧库启动时自动获得，
+      这里再做一次存在性兜底（针对仅执行迁移而不执行完整 SCHEMA 的场景）。
     新版本引入的设置项由 init_db 中的 INSERT OR IGNORE 补默认值。
     """
     rcols = {r["name"] for r in conn.execute("PRAGMA table_info(reviewers)")}
@@ -126,6 +155,29 @@ def _migrate(conn: sqlite3.Connection) -> None:
     mcols = {r["name"] for r in conn.execute("PRAGMA table_info(manuscripts)")}
     if "required_leads" not in mcols:
         conn.execute("ALTER TABLE manuscripts ADD COLUMN required_leads INTEGER NOT NULL DEFAULT 0")
+    # 申报链接表幂等兜底：与 SCHEMA 中定义保持一致
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "conflict_declarations" not in tables:
+        conn.executescript(
+            """
+            CREATE TABLE conflict_declarations (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                reviewer_id      INTEGER NOT NULL REFERENCES reviewers(id) ON DELETE CASCADE,
+                token_hash       TEXT NOT NULL UNIQUE,
+                manifest         TEXT NOT NULL DEFAULT '[]',
+                manifest_hash    TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending','submitted','revoked')),
+                submitted_conflicts TEXT,
+                revoked_reason   TEXT,
+                created_at       TEXT NOT NULL,
+                submitted_at     TEXT,
+                revoked_at       TEXT
+            );
+            CREATE UNIQUE INDEX idx_declarations_one_pending_per_reviewer
+                ON conflict_declarations(reviewer_id) WHERE status = 'pending';
+            """)
 
 
 def get_setting(conn: sqlite3.Connection, key: str) -> Any:
