@@ -59,6 +59,12 @@ class LockIn(BaseModel):
     locked: bool
 
 
+class CoiSubmitIn(BaseModel):
+    """利益冲突自助申报提交：本次勾选的稿件 id 列表（可为空，表示无冲突）。"""
+
+    manuscript_ids: List[int] = Field(default_factory=list)
+
+
 class TopicsIn(BaseModel):
     """仅用于前端校验的占位模型（当前未使用，保留扩展）。"""
 

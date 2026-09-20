@@ -216,6 +216,36 @@ table.matrix { border-collapse: collapse; width: 100%; min-width: 500px; }
 .matrix td.mtitle { text-align: left; font-weight: 600; white-space: nowrap; }
 .matrix input[type="checkbox"] { width: 17px; height: 17px; cursor: pointer; accent-color: var(--red); }
 
+/* ---------------- 利益冲突自助申报 ---------------- */
+.coi-badge {
+  display: inline-block; border-radius: 20px; padding: 1px 10px;
+  font-size: 12px; background: #eef1f7; color: var(--muted); margin-right: 4px;
+}
+.coi-badge.pending { background: var(--amber-soft); color: var(--amber); }
+.coi-badge.ok { background: var(--green-soft); color: var(--green); }
+.coi-badge.bad { background: var(--red-soft); color: var(--red); }
+
+#coi-url-box { width: 100%; margin-top: 10px; font-size: 12.5px; }
+
+/* 评审人申报页 */
+body.coi-body { display: flex; justify-content: center; padding: 40px 16px; }
+.coi-card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 24px 26px; width: min(640px, 100%);
+}
+.coi-card h1 { font-size: 20px; margin-bottom: 12px; }
+.coi-item {
+  display: block; padding: 9px 11px; border: 1px solid var(--line);
+  border-radius: 8px; margin-bottom: 8px; cursor: pointer; font-size: 14px;
+}
+.coi-item:hover { background: #fafbfe; border-color: #c2cadb; }
+.coi-item input {
+  width: 16px; height: 16px; margin-right: 8px;
+  vertical-align: -2px; accent-color: var(--red); cursor: pointer;
+}
+#coi-form .btn { margin-top: 10px; }
+
 /* ---------------- 设置 ---------------- */
 .settings-panel summary { cursor: pointer; list-style: none; }
 .settings-panel summary::-webkit-details-marker { display: none; }

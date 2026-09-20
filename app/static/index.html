@@ -119,6 +119,15 @@
     <section id="tab-conflicts" class="tab-panel">
       <div class="panel">
         <div class="panel-head">
+          <h2>利益冲突自助申报</h2>
+          <p class="hint">为评审人生成一次性申报链接：页面仅展示稿件标题，评审勾选冲突后提交，勾选项将合并进下方冲突矩阵且链接立即失效。
+            链接绑定签发时的稿件清单——签发后稿件增删或标题变化，链接自动失效（提交返回 409 且不写入），可重新生成。
+            令牌只保存哈希，完整链接仅在生成时显示一次，请立即复制并发送给评审人。</p>
+        </div>
+        <div id="coi-list"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
           <h2>作者冲突矩阵</h2>
           <p class="hint">勾选表示该稿件与该评审人存在作者冲突；冲突边在求解图中根本不会建立，因此绝不可能被分配。已锁定的分配需先解锁才能勾选冲突。</p>
         </div>

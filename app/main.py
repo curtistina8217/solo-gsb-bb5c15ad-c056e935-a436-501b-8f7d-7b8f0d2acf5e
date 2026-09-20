@@ -14,9 +14,10 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import coi, db
 from .db import get_conn, get_setting, normalize_institution, normalize_topics, seed_demo_data, set_setting, transaction
 from .schemas import (
+    CoiSubmitIn,
     ConflictIn,
     LockIn,
     ManuscriptIn,
@@ -80,9 +81,12 @@ def build_state(conn: sqlite3.Connection) -> dict:
 
     ms_list = load_manuscripts()
     rv_list = load_reviewers()
+    # 每位评审的自助申报状态（未签发/待提交/已提交/已失效）；快照摘要只算一次
+    coi_digest = coi.snapshot_digest(coi.manuscript_snapshot(conn))
     for rv in rv_list:
         rv["assigned"] = load.get(rv["id"], 0)
         rv["locked_assigned"] = locked_load.get(rv["id"], 0)
+        rv["coi"] = coi.reviewer_status(conn, rv["id"], coi_digest)
 
     per_m: dict[int, int] = {}
     for a in assignments:
@@ -265,6 +269,55 @@ def delete_conflict(m_id: int, r_id: int, conn=Depends(get_conn)):
     return build_state(conn)
 
 
+# ------------------------------------------------------- 利益冲突自助申报
+def _coi_http(fn, *args):
+    """把 COI 流程错误转成对应的 HTTP 响应（明确状态码，不部分写入）。"""
+    try:
+        return fn(*args)
+    except coi.CoiError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
+@app.post("/api/coi-links/{r_id}")
+def create_coi_link(r_id: int, conn=Depends(get_conn)):
+    """管理员为评审人生成一次性申报链接；重复生成会使旧链接立即失效。
+
+    明文令牌仅随本响应返回一次；服务端只保存其哈希，日志与状态接口均不回传。
+    """
+    _get_or_404(conn, "reviewers", r_id, "评审人")
+    with transaction(conn):
+        token = coi.issue_link(conn, r_id)
+    return build_state(conn) | {"coi_url": f"/coi/{token}"}
+
+
+@app.delete("/api/coi-links/{r_id}")
+def revoke_coi_link(r_id: int, conn=Depends(get_conn)):
+    """撤销待提交的申报链接（已提交的链接不可撤销）。"""
+    _get_or_404(conn, "reviewers", r_id, "评审人")
+    with transaction(conn):
+        _coi_http(coi.revoke_link, conn, r_id)
+    return build_state(conn)
+
+
+@app.get("/api/coi/{token}")
+def coi_form(token: str, conn=Depends(get_conn)):
+    """评审人打开申报链接：仅返回其姓名与稿件标题清单。"""
+    return _coi_http(coi.get_form, conn, token)
+
+
+@app.post("/api/coi/{token}")
+def coi_submit(token: str, body: CoiSubmitIn, conn=Depends(get_conn)):
+    """评审人提交申报：单事务合并冲突并立即失效链接；重复提交/快照过期明确报错。"""
+    result = _coi_http(coi.submit, conn, token, body.manuscript_ids)
+    return {"ok": True, **result}
+
+
+@app.get("/coi/{token}")
+def coi_page(token: str):
+    """评审人自助申报页面（无需登录，凭一次性链接访问）。"""
+    return FileResponse(os.path.join(STATIC_DIR, "coi.html"))
+
+
 # ----------------------------------------------------------------- 设置
 @app.put("/api/settings")
 def update_settings(body: SettingsIn, conn=Depends(get_conn)):
@@ -363,6 +416,7 @@ def load_demo(conn=Depends(get_conn)):
     with transaction(conn):
         conn.execute("DELETE FROM assignments")
         conn.execute("DELETE FROM conflicts")
+        conn.execute("DELETE FROM coi_links")
         conn.execute("DELETE FROM manuscripts")
         conn.execute("DELETE FROM reviewers")
         seed_demo_data(conn)
@@ -376,6 +430,7 @@ def reset_all(conn=Depends(get_conn)):
     with transaction(conn):
         conn.execute("DELETE FROM assignments")
         conn.execute("DELETE FROM conflicts")
+        conn.execute("DELETE FROM coi_links")
         conn.execute("DELETE FROM manuscripts")
         conn.execute("DELETE FROM reviewers")
         set_setting(conn, "last_solution", None)

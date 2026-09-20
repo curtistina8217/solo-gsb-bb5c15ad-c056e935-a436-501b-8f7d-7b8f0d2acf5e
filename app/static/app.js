@@ -336,6 +336,72 @@ function renderReviewers() {
 }
 
 /* --------------------------------------------------------------- 渲染：冲突矩阵 */
+const COI_STATUS = {
+  not_issued: { label: "未签发", cls: "" },
+  pending: { label: "待提交", cls: "pending" },
+  submitted: { label: "已提交", cls: "ok" },
+  invalidated: { label: "已失效", cls: "bad" },
+};
+
+function renderCoiLinks() {
+  const box = $("#coi-list");
+  if (!state.reviewers.length) {
+    box.innerHTML = `<div class="empty">暂无评审人，请先到「评审人」页录入。</div>`;
+    return;
+  }
+  box.innerHTML = state.reviewers.map((r) => {
+    const c = r.coi || { status: "not_issued" };
+    const s = COI_STATUS[c.status] || COI_STATUS.not_issued;
+    const reason = c.reason === "stale" ? "（签发后稿件清单已变化）"
+      : c.reason === "revoked" ? "（已被撤销）" : "";
+    const time = c.status === "submitted" && c.submitted_at
+      ? ` · 提交于 ${esc(c.submitted_at)}`
+      : c.created_at ? ` · 签发于 ${esc(c.created_at)}` : "";
+    return `<div class="entity-row">
+      <div class="entity-main">
+        <div class="entity-title">${esc(r.name)}</div>
+        <div class="entity-sub">
+          <span class="coi-badge ${s.cls}">${s.label}</span>${esc(reason)}${time}
+        </div>
+      </div>
+      <div class="entity-actions">
+        <button class="btn small" data-coi-gen="${r.id}">${c.status === "pending" ? "重新生成链接" : "生成链接"}</button>
+        ${c.status === "pending"
+          ? `<button class="btn small danger-ghost" data-coi-revoke="${r.id}">撤销</button>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+/* 生成后弹出一次性链接：完整链接仅此处显示一次，服务端不保存明文令牌 */
+function showCoiLink(url) {
+  $("#modal-title").textContent = "一次性申报链接（仅完整显示一次）";
+  $("#modal-body").innerHTML = `
+    <p class="hint">请立即复制并发送给评审人。链接为一次性：提交或撤销后即失效；
+    服务器只保存令牌哈希，关闭本窗口后无法再次查看完整链接。</p>
+    <input type="text" id="coi-url-box" readonly value="${esc(url)}" />`;
+  $("#modal").classList.remove("hidden");
+  const okBtn = $("#modal-ok");
+  const cleanup = () => {
+    $("#modal").classList.add("hidden");
+    okBtn.textContent = "确定";
+    okBtn.onclick = null;
+    $("#modal-cancel").onclick = null;
+  };
+  $("#modal-cancel").onclick = cleanup;
+  okBtn.textContent = "复制并关闭";
+  okBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("链接已复制");
+    } catch (e) {
+      $("#coi-url-box").select();
+      toast("复制失败，请手动复制", true);
+    }
+    cleanup();
+  };
+}
+
 function renderConflicts() {
   if (!state.manuscripts.length || !state.reviewers.length) {
     $("#conflict-matrix").innerHTML =
@@ -375,6 +441,7 @@ function render() {
   renderReviewerLoad();
   renderManuscripts();
   renderReviewers();
+  renderCoiLinks();
   renderConflicts();
   renderSettings();
 }
@@ -489,6 +556,31 @@ function bindEvents() {
     const delR = e.target.closest("[data-del-r]");
     const lockBtn = e.target.closest("[data-lock]");
     const manualBtn = e.target.closest("[data-manual-lock]");
+    const coiGen = e.target.closest("[data-coi-gen]");
+    const coiRevoke = e.target.closest("[data-coi-revoke]");
+
+    if (coiGen) {
+      const rId = Number(coiGen.dataset.coiGen);
+      const r = state._rById[rId];
+      if (r.coi && r.coi.status === "pending" &&
+          !confirm(`重新生成将使 ${r.name} 的旧链接立即失效，是否继续？`)) return;
+      const data = await runAction(
+        api(`/api/coi-links/${rId}`, { method: "POST" }), "申报链接已生成");
+      if (data.coi_url) {
+        const url = location.origin + data.coi_url;
+        delete state.coi_url; // 明文链接不滞留在前端状态中
+        showCoiLink(url);
+      }
+      return;
+    }
+    if (coiRevoke) {
+      const rId = Number(coiRevoke.dataset.coiRevoke);
+      const r = state._rById[rId];
+      if (!confirm(`撤销 ${r.name} 的待提交链接？撤销后该链接立即失效。`)) return;
+      await runAction(
+        api(`/api/coi-links/${rId}`, { method: "DELETE" }), "链接已撤销");
+      return;
+    }
 
     if (editM) {
       const m = state._mById[editM.dataset.editM];

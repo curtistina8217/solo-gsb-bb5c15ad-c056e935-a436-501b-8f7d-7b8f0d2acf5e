@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS assignments (
     locked INTEGER NOT NULL DEFAULT 0,
     UNIQUE (m_id, r_id)
 );
+
+-- 利益冲突自助申报的一次性链接（每位评审人至多一条；重新签发即替换，旧令牌立即失效）
+CREATE TABLE IF NOT EXISTS coi_links (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    r_id          INTEGER NOT NULL UNIQUE REFERENCES reviewers(id) ON DELETE CASCADE,
+    token_hash    TEXT NOT NULL UNIQUE,  -- 仅存令牌的 SHA-256 哈希；明文只在签发响应中出现一次
+    snapshot      TEXT NOT NULL,         -- 签发时稿件清单快照 JSON：[{id, title}, ...]
+    snapshot_hash TEXT NOT NULL,         -- 快照摘要；稿件增删/标题变化即不匹配 → 链接失效
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending / submitted / revoked
+    created_at    TEXT NOT NULL,
+    submitted_at  TEXT
+);
 """
 
 
@@ -116,6 +128,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     - reviewers.institution：评审人可选机构（旧库补列，默认空串=未填写）。
     - reviewers.can_lead / manuscripts.required_leads：主审资格硬约束
       （旧库补列，默认 0=不可任主审 / 不需主审，即该约束默认关闭）。
+    - coi_links：利益冲突自助申报的一次性链接（新表由 SCHEMA 的
+      CREATE TABLE IF NOT EXISTS 自动补齐，无需 ALTER）。
     新版本引入的设置项由 init_db 中的 INSERT OR IGNORE 补默认值。
     """
     rcols = {r["name"] for r in conn.execute("PRAGMA table_info(reviewers)")}

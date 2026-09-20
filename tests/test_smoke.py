@@ -474,6 +474,249 @@ def test_lead_migration_defaults_off() -> None:
         db.DB_PATH = old_path
 
 
+# ----------------------------------------------------------------- COI 自助申报
+def _make_coi_scenario(conn) -> None:
+    """清空并构造：3 篇稿件（稿件甲/乙/丙，ID 1-3）+ 1 名评审人（评审A，ID 1）。"""
+    conn.execute("DELETE FROM assignments")
+    conn.execute("DELETE FROM conflicts")
+    conn.execute("DELETE FROM coi_links")
+    conn.execute("DELETE FROM manuscripts")
+    conn.execute("DELETE FROM reviewers")
+    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('manuscripts','reviewers')")
+    for t in ["稿件甲", "稿件乙", "稿件丙"]:
+        conn.execute(
+            "INSERT INTO manuscripts(title, topics, required_reviews) VALUES (?, '[]', 1)", (t,))
+    conn.execute("INSERT INTO reviewers(name, topics, capacity) VALUES ('评审A', '[]', 3)")
+    conn.commit()
+
+
+def _conflict_pairs(conn) -> set:
+    return {(r["m_id"], r["r_id"]) for r in conn.execute("SELECT m_id, r_id FROM conflicts")}
+
+
+def test_coi_link_lifecycle() -> None:
+    """签发→打开→提交→失效的完整链路；令牌只存哈希；重复提交明确报错且不写入。"""
+    from app import coi
+    conn = _connect()
+    try:
+        _make_coi_scenario(conn)
+        # 未签发
+        assert coi.reviewer_status(conn, 1)["status"] == coi.NOT_ISSUED
+        # 签发 → 待提交；明文令牌仅此处返回一次
+        token = coi.issue_link(conn, 1)
+        conn.commit()
+        assert coi.reviewer_status(conn, 1)["status"] == coi.PENDING
+        # 库中只保存哈希，且不等于明文令牌
+        row = conn.execute("SELECT token_hash FROM coi_links WHERE r_id=1").fetchone()
+        assert row["token_hash"] == coi.hash_token(token)
+        assert row["token_hash"] != token
+        # 打开链接：只返回姓名与稿件标题（不含主题、需求等任何其他字段）
+        form = coi.get_form(conn, token)
+        assert form["reviewer_name"] == "评审A"
+        assert [m["title"] for m in form["manuscripts"]] == ["稿件甲", "稿件乙", "稿件丙"]
+        assert all(set(m.keys()) == {"id", "title"} for m in form["manuscripts"])
+        # 提交：勾选合并进冲突矩阵，链接立即失效
+        assert coi.submit(conn, token, [1, 3])["merged"] == 2
+        assert _conflict_pairs(conn) == {(1, 1), (3, 1)}
+        assert coi.reviewer_status(conn, 1)["status"] == coi.SUBMITTED
+        # 重复提交：明确 409，且不得部分写入
+        try:
+            coi.submit(conn, token, [2])
+            assert False, "重复提交应当报错"
+        except coi.CoiError as e:
+            assert e.status_code == 409
+        assert _conflict_pairs(conn) == {(1, 1), (3, 1)}
+        # 已提交链接再次打开同样报错
+        try:
+            coi.get_form(conn, token)
+            assert False, "已提交链接不应再打开"
+        except coi.CoiError as e:
+            assert e.status_code == 409
+    finally:
+        conn.close()
+
+
+def test_coi_merge_keeps_existing_conflicts() -> None:
+    """提交是“合并”：既有冲突保留，重复勾选幂等，空提交合法。"""
+    from app import coi
+    conn = _connect()
+    try:
+        _make_coi_scenario(conn)
+        conn.execute("INSERT INTO conflicts(m_id, r_id) VALUES (2, 1)")  # 既有冲突
+        conn.commit()
+        token = coi.issue_link(conn, 1)
+        assert coi.submit(conn, token, [1, 2])["merged"] == 2  # 2 已存在，幂等
+        assert _conflict_pairs(conn) == {(1, 1), (2, 1)}
+        # 空提交（声明无冲突）同样消费链接
+        token2 = coi.issue_link(conn, 1)
+        assert coi.submit(conn, token2, [])["merged"] == 0
+        assert coi.reviewer_status(conn, 1)["status"] == coi.SUBMITTED
+        assert _conflict_pairs(conn) == {(1, 1), (2, 1)}  # 不删除任何既有冲突
+    finally:
+        conn.close()
+
+
+def test_coi_stale_snapshot_blocks_with_409() -> None:
+    """签发后稿件增删或标题变化：状态展示为已失效，打开/提交均 409 且不写入。"""
+    from app import coi
+    conn = _connect()
+    try:
+        _make_coi_scenario(conn)
+        token = coi.issue_link(conn, 1)
+        conn.commit()
+        # 标题变化 → 已失效（stale）
+        conn.execute("UPDATE manuscripts SET title='稿件甲（改）' WHERE id=1")
+        conn.commit()
+        st = coi.reviewer_status(conn, 1)
+        assert st["status"] == coi.INVALIDATED and st["reason"] == "stale"
+        for fn in (lambda: coi.submit(conn, token, [1]), lambda: coi.get_form(conn, token)):
+            try:
+                fn()
+                assert False, "快照过期应当 409"
+            except coi.CoiError as e:
+                assert e.status_code == 409
+        assert _conflict_pairs(conn) == set()  # 未写入任何冲突
+        # 稿件增删同样使链接失效
+        conn.execute("UPDATE manuscripts SET title='稿件甲' WHERE id=1")
+        conn.execute("INSERT INTO manuscripts(title, topics, required_reviews) VALUES ('稿件丁','[]',1)")
+        conn.commit()
+        assert coi.reviewer_status(conn, 1)["status"] == coi.INVALIDATED
+        # 管理员重新生成：新链接绑定新清单可用，旧令牌立即失效（404）
+        token2 = coi.issue_link(conn, 1)
+        conn.commit()
+        assert token2 != token
+        try:
+            coi.get_form(conn, token)
+            assert False, "旧令牌应已失效"
+        except coi.CoiError as e:
+            assert e.status_code == 404
+        form = coi.get_form(conn, token2)
+        assert [m["title"] for m in form["manuscripts"]] == ["稿件甲", "稿件乙", "稿件丙", "稿件丁"]
+        assert coi.submit(conn, token2, [4])["merged"] == 1
+        assert _conflict_pairs(conn) == {(4, 1)}
+    finally:
+        conn.close()
+
+
+def test_coi_revoke_and_validation() -> None:
+    """撤销待提交链接；已提交不可撤销；勾选清单外稿件 400 且不消费链接。"""
+    from app import coi
+    conn = _connect()
+    try:
+        _make_coi_scenario(conn)
+        # 未签发时撤销 → 404
+        try:
+            coi.revoke_link(conn, 1)
+            assert False, "未签发不应可撤销"
+        except coi.CoiError as e:
+            assert e.status_code == 404
+        # 签发 → 撤销 → 已失效（revoked），使用返回 410
+        token = coi.issue_link(conn, 1)
+        conn.commit()
+        coi.revoke_link(conn, 1)
+        conn.commit()
+        st = coi.reviewer_status(conn, 1)
+        assert st["status"] == coi.INVALIDATED and st["reason"] == "revoked"
+        try:
+            coi.submit(conn, token, [1])
+            assert False, "已撤销链接不应可提交"
+        except coi.CoiError as e:
+            assert e.status_code == 410
+        assert _conflict_pairs(conn) == set()
+        # 重复撤销 → 409
+        try:
+            coi.revoke_link(conn, 1)
+            assert False, "重复撤销应当报错"
+        except coi.CoiError as e:
+            assert e.status_code == 409
+        # 勾选清单外稿件 → 400，链接仍是待提交（未消费、未写入）
+        token2 = coi.issue_link(conn, 1)
+        conn.commit()
+        try:
+            coi.submit(conn, token2, [999])
+            assert False, "清单外稿件应当 400"
+        except coi.CoiError as e:
+            assert e.status_code == 400
+        assert coi.reviewer_status(conn, 1)["status"] == coi.PENDING
+        assert _conflict_pairs(conn) == set()
+        # 已提交的链接不可撤销
+        coi.submit(conn, token2, [])
+        try:
+            coi.revoke_link(conn, 1)
+            assert False, "已提交不应可撤销"
+        except coi.CoiError as e:
+            assert e.status_code == 409
+    finally:
+        conn.close()
+
+
+def test_coi_migration_adds_table() -> None:
+    """旧库（无 coi_links 表）启动迁移后自动补表，既有数据保留。"""
+    path = os.path.join(tempfile.mkdtemp(prefix="review-mig-coi-"), "old.db")
+    from app import db
+    old_path = db.DB_PATH
+    db.DB_PATH = path
+    try:
+        import sqlite3
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE reviewers (id INTEGER PRIMARY KEY, name TEXT, topics TEXT, capacity INTEGER)")
+        c.execute("INSERT INTO reviewers(name, topics, capacity) VALUES ('老评审','[]',3)")
+        c.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("CREATE TABLE manuscripts (id INTEGER PRIMARY KEY, title TEXT, topics TEXT, required_reviews INTEGER)")
+        c.execute("CREATE TABLE conflicts (m_id INTEGER, r_id INTEGER)")
+        c.execute("CREATE TABLE assignments (id INTEGER PRIMARY KEY, m_id INTEGER, r_id INTEGER, locked INTEGER)")
+        c.commit()
+        c.close()
+
+        init_db(seed_demo=False)
+        c2 = sqlite3.connect(path)
+        tables = {r[0] for r in c2.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "coi_links" in tables
+        assert c2.execute("SELECT COUNT(*) FROM reviewers").fetchone()[0] == 1  # 数据保留
+        c2.close()
+    finally:
+        db.DB_PATH = old_path
+
+
+def test_coi_api_state_has_status_without_hash() -> None:
+    """接口层：生成链接返回一次性 URL；状态接口含申报状态但绝不回传令牌或哈希。"""
+    try:
+        from fastapi import HTTPException
+        from app.main import build_state, create_coi_link, revoke_coi_link
+    except ModuleNotFoundError:
+        print("  （跳过 COI 接口测试：未安装 fastapi/pydantic）")
+        return
+    conn = _connect()
+    try:
+        _make_coi_scenario(conn)
+        st = create_coi_link(1, conn)
+        assert st["coi_url"].startswith("/coi/")
+        token = st["coi_url"].rsplit("/", 1)[-1]
+        # 除本次响应的 coi_url 外，完整状态不再出现明文令牌，且绝不包含任何哈希字段
+        blob = json.dumps(st, ensure_ascii=False).replace(st["coi_url"], "")
+        assert token not in blob
+        assert "token_hash" not in blob and "snapshot_hash" not in blob
+        rv = [r for r in st["reviewers"] if r["id"] == 1][0]
+        assert rv["coi"]["status"] == "pending"
+        # 再次拉取状态：不包含 coi_url / 令牌 / 哈希
+        blob2 = json.dumps(build_state(conn), ensure_ascii=False)
+        assert token not in blob2 and "coi_url" not in blob2 and "token_hash" not in blob2
+        # 撤销后状态为已失效
+        st = revoke_coi_link(1, conn)
+        rv = [r for r in st["reviewers"] if r["id"] == 1][0]
+        assert rv["coi"]["status"] == "invalidated"
+        # 未签发的评审撤销 → 404
+        conn.execute("DELETE FROM coi_links")
+        conn.commit()
+        try:
+            revoke_coi_link(1, conn)
+            assert False, "应当 404"
+        except HTTPException as e:
+            assert e.status_code == 404
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     test_mcmf_known_case()
     test_demo_solve_constraints()
@@ -489,4 +732,10 @@ if __name__ == "__main__":
     test_lead_free_assignment_prefers_nothing_when_disabled()
     test_lead_api_validation()
     test_lead_migration_defaults_off()
+    test_coi_link_lifecycle()
+    test_coi_merge_keeps_existing_conflicts()
+    test_coi_stale_snapshot_blocks_with_409()
+    test_coi_revoke_and_validation()
+    test_coi_migration_adds_table()
+    test_coi_api_state_has_status_without_hash()
     print("所有冒烟测试通过 ✅")
